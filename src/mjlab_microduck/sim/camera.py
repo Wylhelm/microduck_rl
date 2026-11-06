@@ -107,7 +107,7 @@ class Camera:
         self.renderer = mujoco.Renderer(model, height=self.height, width=self.width)
 
     def render(self, visual, viewer=None) -> None:
-        """Render the same private snapshot as the viewer, on the step loop's thread."""
+        """Render the viewer's private snapshot, never on the physics worker."""
         if self.model is not visual.model:
             self.renderer.close()
             self.bind_model(visual.model)

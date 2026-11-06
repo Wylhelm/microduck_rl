@@ -35,6 +35,11 @@ Update the runtime together with
 this repository; a protocol-1 daemon is incompatible. The runtime owns the
 [simulation protocol documentation](https://github.com/pollen-robotics/microduck/blob/main/docs/design/simulation.md).
 
+Physics runs on a dedicated real-time worker; slow camera or viewer frames do
+not change the policy's physics rate. Rendering stays on the main thread and
+uses the private visual snapshot. See the protocol documentation above for
+assisted recovery after a simulated fall.
+
 Requires a CUDA GPU (training runs through MuJoCo Warp) and [uv](https://docs.astral.sh/uv/).
 
 > **On ARM boxes (DGX Spark / GB10, Jetson):** `uv sync` pulls ~2 GB of CUDA

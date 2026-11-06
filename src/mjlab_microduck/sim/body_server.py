@@ -41,6 +41,7 @@ filter does on the robot, on the other side of the same wire.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import socket
@@ -625,7 +626,32 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def run(world: World, headless: bool, visual: VisualWorld | None = None) -> None:
+def step_loop(world: World, stop: threading.Event) -> None:
+    """Keep physics at the daemon's wall-clock rate, independently of rendering."""
+    dt = world.model.opt.timestep
+    batch = max(1, round(0.020 / dt))
+    period = batch * dt
+    next_step = time.perf_counter()
+    behind = 0
+    while not stop.is_set():
+        world.step(batch)
+        next_step += period
+        slack = next_step - time.perf_counter()
+        if slack > 0:
+            stop.wait(slack)
+        elif slack < -0.25:
+            behind += 1
+            print(
+                f"== physics behind real time by {-slack:.2f}s (x{behind})",
+                flush=True,
+            )
+            next_step = time.perf_counter()
+
+
+def run(
+    world: World, headless: bool, visual: VisualWorld | None = None,
+    *, stop: threading.Event | None = None, camera_fps: int = CAMERA_FPS,
+) -> None:
     """Step in real time.
 
     **Real time, not as fast as possible.** The daemon's loop is wall-clock and its health gate
@@ -650,42 +676,23 @@ def run(world: World, headless: bool, visual: VisualWorld | None = None) -> None
         except Exception as error:
             print(f"== no viewer ({error}); running headless", flush=True)
 
-    dt = world.model.opt.timestep
-    # One control tick of world per pass: 20 ms, the same decimation `infer_policy.py` uses.
-    batch = max(1, round(0.020 / dt))
-    period = batch * dt
-    # A frame every N passes, counted — not `data.time % 0.033`, which is float arithmetic on an
-    # accumulating value and fires when it feels like it. 30 rather than 60: `viewer.sync()` copies
-    # the scene on this thread, and with several ducks in it that is the difference between keeping
-    # real time and not.
-    passes_per_frame = max(1, round((1.0 / 30.0) / period))
-    # The cameras, at their own rate — slower than the viewer and far slower than physics.
+    stop = stop if stop is not None else threading.Event()
     eyes = [b for b in world.bodies if b.camera is not None]
-    passes_per_eye = max(1, round((1.0 / CAMERA_FPS) / period))
-    step = 0
-    next_step = time.perf_counter()
-    behind = 0
+    eye_period = 1.0 / max(1, camera_fps)
+    render_period = min(1.0 / 30.0, eye_period) if viewer is not None else eye_period
+    next_eye = time.perf_counter()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="duck-physics")
+    physics = executor.submit(step_loop, world, stop)
     try:
-        while True:
-            world.step(batch)
+        while not stop.is_set():
+            if physics.done():
+                physics.result()
+                break
             if viewer is not None and not viewer.is_running():
                 break
-            next_step += period
-            slack = next_step - time.perf_counter()
-            # Only sleep when there is something worth sleeping for: `time.sleep` on a few
-            # milliseconds overshoots by more than it waits.
-            if slack > 0.002:
-                time.sleep(slack)
-            elif slack < -0.25:
-                behind += 1
-                print(
-                    f"== behind real time by {-slack:.2f}s (x{behind}) — fewer ducks, or --headless",
-                    flush=True,
-                )
-                next_step = time.perf_counter()
-            step += 1
-            viewer_frame = viewer is not None and step % passes_per_frame == 0
-            camera_frame = bool(eyes) and step % passes_per_eye == 0
+            started = time.perf_counter()
+            viewer_frame = viewer is not None
+            camera_frame = bool(eyes) and started >= next_eye
             if visual is not None and (viewer_frame or camera_frame):
                 old_model = visual.model
                 if viewer is not None:
@@ -714,11 +721,16 @@ def run(world: World, headless: bool, visual: VisualWorld | None = None) -> None
                 for body in eyes:
                     if body.camera is not None:
                         body.camera.render(visual, viewer)
+                next_eye = started + eye_period
+            stop.wait(max(0.0, render_period - (time.perf_counter() - started)))
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
+        executor.shutdown(wait=True)
         if viewer is not None:
             viewer.close()
+        physics.result()
 
 
 def main() -> None:
@@ -800,7 +812,7 @@ def main() -> None:
         eye = f" · camera on {args.host}:{args.frame_port + index}" if index in wanted else ""
         print(f"==   duck {index}: robotd --sim {args.host}:{args.port + index}{eye}", flush=True)
 
-    run(world, headless=args.headless, visual=visual)
+    run(world, headless=args.headless, visual=visual, camera_fps=args.camera_fps)
 
 
 if __name__ == "__main__":

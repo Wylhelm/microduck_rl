@@ -1,5 +1,7 @@
 import os
 import threading
+import time
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
@@ -12,6 +14,7 @@ from mjlab_microduck.sim.body_server import (
     Handler,
     World,
     floor_clearance,
+    run,
 )
 from mjlab_microduck.sim.camera import Camera
 from mjlab_microduck.sim.visual import VisualWorld
@@ -219,3 +222,50 @@ def test_protocol_dispatch_and_sensor_reads_during_switch():
         reader.join(timeout=2)
     assert not reader.is_alive()
     assert not errors
+
+
+def test_slow_camera_does_not_slow_physics():
+    world = make_world()
+    frames = []
+    stop = threading.Event()
+    errors = []
+
+    def render(*args):
+        time.sleep(0.1)
+        frames.append(world.data.time)
+
+    world.bodies[0].camera = SimpleNamespace(render=render)
+    visual = SimpleNamespace(model=world.model, update=lambda: None)
+
+    def drive():
+        try:
+            run(world, headless=True, visual=visual, stop=stop)
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=drive)
+    thread.start()
+    started = time.perf_counter()
+    try:
+        time.sleep(0.8)
+    finally:
+        stop.set()
+        thread.join(timeout=3)
+    elapsed = time.perf_counter() - started
+    assert not thread.is_alive()
+    assert not errors
+    assert len(frames) >= 3
+    assert world.data.time >= elapsed * 0.8
+
+
+def test_physics_worker_errors_reach_the_main_loop():
+    def fail(*args):
+        raise ValueError("physics failed")
+
+    world = SimpleNamespace(
+        model=SimpleNamespace(opt=SimpleNamespace(timestep=0.005)),
+        bodies=[],
+        step=fail,
+    )
+    with pytest.raises(ValueError, match="physics failed"):
+        run(world, headless=True)
