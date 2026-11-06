@@ -68,6 +68,16 @@ class Camera:
     """
 
     def __init__(self, model: mujoco.MjModel, name: str, width: int = WIDTH, height: int = HEIGHT):
+        self.name = name
+        self.width = width
+        self.height = height
+        self.latest: bytes | None = None
+        self.lock = threading.Lock()
+        self.bind_model(model)
+
+    def bind_model(self, model: mujoco.MjModel) -> None:
+        self.model = model
+        name = self.name
         self.camera = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, name)
         if self.camera < 0:
             raise SystemExit(f"the model has no camera {name!r}")
@@ -94,14 +104,13 @@ class Camera:
         fixed = np.zeros(4)
         mujoco.mju_mulQuat(fixed, model.cam_quat[self.camera], turn)
         model.cam_quat[self.camera] = fixed
-        self.renderer = mujoco.Renderer(model, height=height, width=width)
-        self.width = width
-        self.height = height
-        self.latest: bytes | None = None
-        self.lock = threading.Lock()
+        self.renderer = mujoco.Renderer(model, height=self.height, width=self.width)
 
     def render(self, visual, viewer=None) -> None:
         """Render the same private snapshot as the viewer, on the step loop's thread."""
+        if self.model is not visual.model:
+            self.renderer.close()
+            self.bind_model(visual.model)
         with viewer.lock() if viewer is not None else nullcontext():
             self.renderer.update_scene(visual.data, camera=self.camera)
         packed = to_uyvy(self.renderer.render())

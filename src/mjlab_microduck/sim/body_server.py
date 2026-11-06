@@ -47,6 +47,7 @@ import socket
 import socketserver
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import mujoco
@@ -57,7 +58,7 @@ from mjlab_microduck.sim.camera import Camera, FrameHandler, FrameServer
 from mjlab_microduck.sim.tof import COLS, ROWS, Tof
 from mjlab_microduck.sim.visual import MOUTH_CLOSED, VisualWorld
 
-PROTOCOL = 1
+PROTOCOL = 2
 
 # What the policies were trained at, and what `scripts/infer_policy.py` sets. The scenes ship 0.002;
 # with that script's decimation of 4 this is exactly the 50 Hz the daemon's control loop runs at.
@@ -93,9 +94,6 @@ SCENES = Path(__file__).resolve().parents[1] / "robot" / "microduck"
 # against, whose actuator default classes carry `contype="0" conaffinity="0"`, so the robot collides
 # with nothing and sinks through a floor the scene really does contain.
 DEFAULT_SCENE = SCENES / "scene.xml"
-# The robot with no floor and no scenery — what extra ducks are attached from.
-ROBOT_ONLY = SCENES / "robot_allcollisions.xml"
-
 # Far enough apart not to touch at rest, close enough to be in one screenful.
 SPACING = 0.5
 
@@ -103,6 +101,7 @@ SPACING = 0.5
 # `robotctl health` shows a plausible robot instead of an alarming one.
 NOMINAL_VOLTS = 7.4
 NOMINAL_TEMP_C = 32.0
+MODE_SUPPORT_SETTLE_S = 0.3
 
 
 def duck_prefix(index: int) -> str:
@@ -110,7 +109,30 @@ def duck_prefix(index: int) -> str:
     return "" if index == 0 else f"d{index}_"
 
 
-def build_world(scene: Path, count: int) -> mujoco.MjModel:
+def robot_file(scene: Path, mode: str | None = None) -> Path:
+    root = ET.parse(scene).getroot()
+    include = next(
+        (node for node in root.findall("include")
+         if Path(node.get("file", "")).name.startswith("robot_")),
+        None,
+    )
+    if include is None:
+        raise ValueError(f"{scene.name} has no replaceable robot include")
+    original = scene.parent / include.attrib["file"]
+    if mode is None:
+        return original
+    backlash = "_backlash" if "backlash" in original.stem else ""
+    if mode == "roller":
+        return SCENES / f"robot_groundcontact_rollers{backlash}.xml"
+    if mode == "walk":
+        return (
+            SCENES / f"robot_groundcontact{backlash}.xml"
+            if "rollers" in original.stem else original
+        )
+    raise ValueError("mode must be walk or roller")
+
+
+def build_world(scene: Path, count: int, modes: list[str] | None = None) -> mujoco.MjModel:
     """One model holding `count` ducks, so they share a floor and can bump into each other.
 
     The scene already contains one duck; the rest are attached to it under a name prefix, which is
@@ -118,14 +140,28 @@ def build_world(scene: Path, count: int) -> mujoco.MjModel:
     ducks in separate physics can be beside each other on a screen and never touch, and "beside each
     other" is what every social behaviour is about.
     """
-    if count == 1:
+    if count == 1 and modes is None:
         return mujoco.MjModel.from_xml_path(str(scene))
 
-    spec = mujoco.MjSpec.from_file(str(scene))
+    if modes is None:
+        spec = mujoco.MjSpec.from_file(str(scene))
+    else:
+        root = ET.parse(scene).getroot()
+        original = robot_file(scene)
+        for node in root.findall("include"):
+            path = scene.parent / node.attrib["file"]
+            node.set("file", str(robot_file(scene, modes[0]) if path == original else path))
+        # Equipment changes nq; a keyframe indexed for the old body cannot be carried across.
+        for keys in root.findall("keyframe"):
+            root.remove(keys)
+        ET.SubElement(root, "compiler", meshdir=str(SCENES / "assets"))
+        spec = mujoco.MjSpec.from_string(ET.tostring(root, encoding="unicode"))
     for index in range(1, count):
         # A fresh child every time: `attach` renames the spec it is given, so reusing one gives the
         # third duck names like `d2_d1_left_hip_yaw` and a compile error about incompatible ids.
-        robot = mujoco.MjSpec.from_file(str(ROBOT_ONLY))
+        robot = mujoco.MjSpec.from_file(str(
+            robot_file(scene, modes[index]) if modes is not None else robot_file(scene)
+        ))
         frame = spec.worldbody.add_frame(pos=[0.0, index * SPACING, 0.0])
         spec.attach(robot, prefix=duck_prefix(index), frame=frame)
     return spec.compile()
@@ -168,6 +204,22 @@ def gravity_in_trunk(quat: np.ndarray) -> np.ndarray:
     return -rotation.reshape(3, 3).T[:, 2]
 
 
+def floor_clearance(model: mujoco.MjModel, data: mujoco.MjData, prefix: str) -> float:
+    floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    if floor < 0 or model.geom_type[floor] != mujoco.mjtGeom.mjGEOM_PLANE:
+        raise ValueError("equipment switching requires a floor plane named 'floor'")
+    trunk = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, prefix + "trunk_base")
+    distances = [
+        mujoco.mj_geomDistance(model, data, geom, floor, 10.0, None)
+        for geom in range(model.ngeom)
+        if model.body_rootid[model.geom_bodyid[geom]] == trunk
+        and (model.geom_contype[geom] or model.geom_conaffinity[geom])
+    ]
+    if not distances:
+        raise ValueError("equipment switching requires robot collision geoms")
+    return min(distances)
+
+
 class World:
     """The physics, shared by every duck in it.
 
@@ -177,11 +229,77 @@ class World:
     """
 
     def __init__(self, scene: Path, count: int = 1):
+        self.scene = scene.resolve()
+        self.count = count
+        initial_mode = "roller" if "rollers" in robot_file(self.scene).stem else "walk"
+        self.modes = [initial_mode] * count
         self.model = build_world(scene, count)
         self.model.opt.timestep = TIMESTEP
         self.data = mujoco.MjData(self.model)
         self.lock = threading.Lock()
+        self.equipment_lock = threading.Lock()
         self.bodies: list[Body] = []
+
+    def set_mode(self, index: int, mode: str) -> None:
+        if mode not in ("walk", "roller"):
+            raise ValueError("mode must be walk or roller")
+        # Compile away from the physics lock: sensor reads can finish on the current model.
+        with self.equipment_lock:
+            if self.modes[index] == mode:
+                return
+            modes = self.modes.copy()
+            modes[index] = mode
+            model = build_world(self.scene, self.count, modes)
+            model.opt.timestep = TIMESTEP
+            data = mujoco.MjData(model)
+            with self.lock:
+                previous, state = self.model, self.data
+                clearance = self.bodies[index].floor_clearance()
+                for joint in range(model.njnt):
+                    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
+                    old = mujoco.mj_name2id(previous, mujoco.mjtObj.mjOBJ_JOINT, name)
+                    if old < 0:
+                        continue
+                    kind = model.jnt_type[joint]
+                    nq = 7 if kind == mujoco.mjtJoint.mjJNT_FREE else (
+                        4 if kind == mujoco.mjtJoint.mjJNT_BALL else 1
+                    )
+                    nv = 6 if kind == mujoco.mjtJoint.mjJNT_FREE else (
+                        3 if kind == mujoco.mjtJoint.mjJNT_BALL else 1
+                    )
+                    new_q, old_q = model.jnt_qposadr[joint], previous.jnt_qposadr[old]
+                    new_v, old_v = model.jnt_dofadr[joint], previous.jnt_dofadr[old]
+                    data.qpos[new_q:new_q + nq] = state.qpos[old_q:old_q + nq]
+                    data.qvel[new_v:new_v + nv] = state.qvel[old_v:old_v + nv]
+                for actuator in range(model.nu):
+                    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator)
+                    old = mujoco.mj_name2id(previous, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                    if old >= 0:
+                        data.ctrl[actuator] = state.ctrl[old]
+                data.time = state.time
+                mujoco.mj_forward(model, data)
+                body = self.bodies[index]
+                trunk_joint = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_JOINT, body.prefix + "trunk_base_freejoint"
+                )
+                trunk_qpos = model.jnt_qposadr[trunk_joint]
+                data.qpos[trunk_qpos + 2] += (
+                    clearance - floor_clearance(model, data, body.prefix)
+                )
+                mujoco.mj_forward(model, data)
+                self.model, self.data = model, data
+                for body in self.bodies:
+                    body.bind_model()
+                    body._apply_torque()
+                # Putting wheels on must not bury them in the floor; taking them off must not
+                # drop the duck. Preserve clearance, planar position, orientation and momentum.
+                for body in self.bodies:
+                    if not body.released:
+                        body.remember()
+                    if body.support_pose is not None:
+                        body.support_pose = data.qpos[body.trunk:body.trunk + 7].copy()
+                self.modes = modes
+            print(f"== duck {index}: equipment switched to {mode}", flush=True)
 
     def step(self, times: int = 1) -> None:
         """Advance the world, taking the lock once for the whole batch.
@@ -201,6 +319,13 @@ class World:
                 for body in self.bodies:
                     if not body.released:
                         body.restore()
+                    elif body.support_pose is not None:
+                        if body.support_until is None or self.data.time < body.support_until:
+                            self.data.qpos[body.trunk:body.trunk + 7] = body.support_pose
+                            self.data.qvel[body.trunk_dof:body.trunk_dof + 6] = 0.0
+                        else:
+                            body.support_pose = None
+                            body.support_until = None
 
 
 class Body:
@@ -210,12 +335,23 @@ class Body:
         self.world = world
         self.index = index
         self.prefix = duck_prefix(index)
-        model = world.model
+        self.camera: Camera | None = None
+        self.bind_model()
+        self.released = limp
+        self.torque_on = not limp
+        self.kp = kp
+        self.held = None
+        self.support_pose: np.ndarray | None = None
+        self.support_until: float | None = None
+        self.visual_mouth = MOUTH_CLOSED
+
+    def bind_model(self) -> None:
+        model = self.world.model
 
         def ident(kind, name):
             found = mujoco.mj_name2id(model, kind, self.prefix + name)
             if found < 0:
-                raise SystemExit(f"the model has no {name!r} for duck {index}")
+                raise ValueError(f"the model has no {name!r} for duck {self.index}")
             return found
 
         # By name, never by index: an MJCF edit reorders silently.
@@ -227,7 +363,7 @@ class Body:
                 self.actuators.append(found)
                 self.to_wire.append(wire_index)
         if not self.actuators:
-            raise SystemExit(f"no actuated joints for duck {index} (prefix {self.prefix!r})")
+            raise ValueError(f"no actuated joints for duck {self.index} (prefix {self.prefix!r})")
 
         self.qpos_adr = np.array(
             [model.jnt_qposadr[model.actuator_trnid[a, 0]] for a in self.actuators]
@@ -237,10 +373,9 @@ class Body:
         )
         # The depth sensor, on the model's own `tof` site — so a head that turns takes it along,
         # which is what makes `robot.look` a way to scan a room.
-        self.tof = Tof(model, ident(mujoco.mjtObj.mjOBJ_SITE, "tof"), seed=index)
+        self.tof = Tof(model, ident(mujoco.mjtObj.mjOBJ_SITE, "tof"), seed=self.index)
         # Built only when this duck is one of `--cameras`: a renderer costs 12 ms a frame, which is
         # forty times what stepping four ducks' physics costs.
-        self.camera: Camera | None = None
         self.trunk = int(model.jnt_qposadr[ident(mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")])
         self.trunk_dof = int(model.jnt_dofadr[ident(mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")])
 
@@ -252,11 +387,34 @@ class Body:
         # any timestep, from any placement — `infer_policy.py` never does it, because it has the
         # policy balancing from step zero. `robotd` deliberately does not enable torque when it
         # starts, so the seconds before it would be spent falling over.
-        self.released = limp
-        self.torque_on = not limp
-        self.kp = kp
-        self.held = None
-        self.visual_mouth = MOUTH_CLOSED
+    def floor_clearance(self) -> float:
+        return floor_clearance(self.world.model, self.world.data, self.prefix)
+
+    def set_mode_support(self, on: bool) -> None:
+        """A simulation-only hand steadies the trunk, leaving the leg motors free."""
+        with self.world.lock:
+            if on and self.released and self.torque_on:
+                if self.support_pose is None:
+                    model, data = self.world.model, self.world.data
+                    placement = mujoco.MjData(model)
+                    placement.qpos[:] = data.qpos
+                    w, x, y, z = data.qpos[self.trunk + 3:self.trunk + 7]
+                    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+                    placement.qpos[self.trunk + 3:self.trunk + 7] = [
+                        math.cos(yaw / 2), 0, 0, math.sin(yaw / 2),
+                    ]
+                    placement.qpos[self.qpos_adr] = [
+                        HOME_POSE[index] for index in self.to_wire
+                    ]
+                    mujoco.mj_forward(model, placement)
+                    placement.qpos[self.trunk + 2] += (
+                        0.001 - floor_clearance(model, placement, self.prefix)
+                    )
+                    self.support_pose = placement.qpos[self.trunk:self.trunk + 7].copy()
+                self.support_until = None
+            elif self.support_pose is not None and self.support_until is None:
+                # The new policy gets a few ticks at home before the hand lets go.
+                self.support_until = self.world.data.time + MODE_SUPPORT_SETTLE_S
 
     # ── placement ─────────────────────────────────────────────────────────
 
@@ -297,8 +455,8 @@ class Body:
     # ── what the daemon sees ──────────────────────────────────────────────
 
     def sensors(self) -> dict:
-        data = self.world.data
         with self.world.lock:
+            data = self.world.data
             sim_time = float(data.time)
             positions = data.qpos[self.qpos_adr].copy()
             velocities = data.qvel[self.qvel_adr].copy()
@@ -307,6 +465,8 @@ class Body:
             gyro = data.qvel[self.trunk_dof + 3 : self.trunk_dof + 6].copy()
             trunk = [float(v) for v in data.qpos[self.trunk : self.trunk + 3]]
             trunk_z = trunk[2]
+            mode = self.world.modes[self.index]
+            supported = self.support_pose is not None
 
         wire_pos = [0.0] * len(JOINT_NAMES)
         wire_vel = [0.0] * len(JOINT_NAMES)
@@ -333,6 +493,8 @@ class Body:
             # advertisement gets for free and a faked one has to be told.
             "trunk": trunk,
             "sim_time": sim_time,
+            "mode": mode,
+            "supported": supported,
             "imu": {
                 "gyro": [float(v) for v in gyro],
                 "gravity": [float(v) for v in gravity_in_trunk(quat)],
@@ -380,6 +542,8 @@ class Body:
             self.torque_on = bool(on)
             if not on:
                 self.visual_mouth = MOUTH_CLOSED
+                self.support_pose = None
+                self.support_until = None
             if on:
                 self.released = True
                 # Torque arriving must not fling the robot at a stale target.
@@ -416,6 +580,8 @@ class Handler(socketserver.StreamRequestHandler):
                 self.wfile.write((json.dumps(answer) + "\n").encode())
                 self.wfile.flush()
         finally:
+            if getattr(self, "mode_support", False):
+                body.set_mode_support(False)
             body.close_visual_mouth()
             print(f"== duck {body.index}: daemon disconnected", flush=True)
 
@@ -438,6 +604,14 @@ class Handler(socketserver.StreamRequestHandler):
             return {}
         if op == "torque":
             body.set_torque(bool(request["on"]))
+            return {}
+        if op == "mode":
+            support = request.get("support", False)
+            if not isinstance(support, bool):
+                raise ValueError("support must be a boolean")
+            body.world.set_mode(body.index, request["mode"])
+            body.set_mode_support(support)
+            self.mode_support = support
             return {}
         if op == "slow":
             return body.slow_sensors()
@@ -513,11 +687,27 @@ def run(world: World, headless: bool, visual: VisualWorld | None = None) -> None
             viewer_frame = viewer is not None and step % passes_per_frame == 0
             camera_frame = bool(eyes) and step % passes_per_eye == 0
             if visual is not None and (viewer_frame or camera_frame):
+                old_model = visual.model
                 if viewer is not None:
                     with viewer.lock():
                         visual.update()
                 else:
                     visual.update()
+                if viewer is not None and old_model is not visual.model:
+                    import mujoco.viewer
+
+                    lookat = viewer.cam.lookat.copy()
+                    distance, azimuth, elevation = (
+                        viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation
+                    )
+                    viewer.close()
+                    viewer = mujoco.viewer.launch_passive(
+                        visual.model, visual.data, show_left_ui=False, show_right_ui=False
+                    )
+                    viewer.cam.lookat[:] = lookat
+                    viewer.cam.distance = distance
+                    viewer.cam.azimuth = azimuth
+                    viewer.cam.elevation = elevation
             if viewer_frame:
                 viewer.sync()
             if camera_frame:

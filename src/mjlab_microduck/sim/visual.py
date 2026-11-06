@@ -18,7 +18,12 @@ class VisualWorld:
     def __init__(self, world):
         self.world = world
         with world.lock:
-            self.model = copy.copy(world.model)
+            self._bind_model()
+
+    def _bind_model(self) -> None:
+        world = self.world
+        self.source_model = world.model
+        self.model = copy.copy(world.model)
         self.data = mujoco.MjData(self.model)
         self.jaws = []
         for body in world.bodies:
@@ -49,6 +54,8 @@ class VisualWorld:
 
     def update(self) -> None:
         with self.world.lock:
+            if self.source_model is not self.world.model:
+                self._bind_model()
             mujoco.mj_copyData(self.data, self.world.model, self.world.data)
             targets = [body.visual_mouth for body, *_ in self.jaws]
 
