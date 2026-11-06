@@ -15,6 +15,7 @@ cameras at 15 fps is most of a core; four without is nothing. Most sessions do n
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import socket
 import socketserver
 import struct
@@ -99,18 +100,10 @@ class Camera:
         self.latest: bytes | None = None
         self.lock = threading.Lock()
 
-    def render(self, world) -> None:
-        """Render one frame, reading `MjData` only while holding the world's lock.
-
-        **`update_scene` reads the whole of `MjData`, and it runs on the step loop's thread while
-        sensor reads run on socket threads.** Unlocked, a ToF read caught a site orientation
-        mid-write and got a zero-length ray direction — which MuJoCo answers with
-        `mj_ray: vector length is too small` and an abort, taking the simulator down with it. The
-        lock is held for the scene copy, which is a millisecond, and released for the render, which
-        is twelve and touches no shared state.
-        """
-        with world.lock:
-            self.renderer.update_scene(world.data, camera=self.camera)
+    def render(self, visual, viewer=None) -> None:
+        """Render the same private snapshot as the viewer, on the step loop's thread."""
+        with viewer.lock() if viewer is not None else nullcontext():
+            self.renderer.update_scene(visual.data, camera=self.camera)
         packed = to_uyvy(self.renderer.render())
         with self.lock:
             self.latest = packed

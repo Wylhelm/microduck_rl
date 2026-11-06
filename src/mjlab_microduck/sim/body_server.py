@@ -32,8 +32,7 @@ for TCP-not-a-unix-socket and JSON-not-a-packed-struct.
 
 **Fifteen joints out here, fourteen in the model.** The daemon indexes joints as `JOINT_NAMES`,
 which includes `mouth` at index 9; no alpha policy drives it and the walking model does not have it.
-The daemon must not learn that, so this inserts and drops it. Where the knowledge about a model's
-own shape lives is the whole reason the protocol carries the robot's units rather than MuJoCo's.
+This inserts a zero sensor value and uses the target only for a separate, visual-only beak.
 
 **Gravity, not just orientation.** The policy observes projected gravity in the trunk frame. MuJoCo
 gives an orientation quaternion, so this does the rotation — the same arithmetic the IMU's SFLP
@@ -43,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import socketserver
 import threading
@@ -55,6 +55,7 @@ import numpy as np
 from mjlab_microduck.sim.camera import FPS as CAMERA_FPS
 from mjlab_microduck.sim.camera import Camera, FrameHandler, FrameServer
 from mjlab_microduck.sim.tof import COLS, ROWS, Tof
+from mjlab_microduck.sim.visual import MOUTH_CLOSED, VisualWorld
 
 PROTOCOL = 1
 
@@ -255,6 +256,7 @@ class Body:
         self.torque_on = not limp
         self.kp = kp
         self.held = None
+        self.visual_mouth = MOUTH_CLOSED
 
     # ── placement ─────────────────────────────────────────────────────────
 
@@ -356,9 +358,17 @@ class Body:
     def set_targets(self, wire_targets: list[float]) -> None:
         if len(wire_targets) != len(JOINT_NAMES):
             raise ValueError(f"expected {len(JOINT_NAMES)} targets, got {len(wire_targets)}")
+        mouth = float(wire_targets[MOUTH_INDEX])
+        if not math.isfinite(mouth):
+            raise ValueError("mouth target must be finite")
         with self.world.lock:
             for slot, wire_index in enumerate(self.to_wire):
                 self.world.data.ctrl[self.actuators[slot]] = wire_targets[wire_index]
+            self.visual_mouth = mouth
+
+    def close_visual_mouth(self) -> None:
+        with self.world.lock:
+            self.visual_mouth = MOUTH_CLOSED
 
     def set_gain(self, kp: int) -> None:
         with self.world.lock:
@@ -368,6 +378,8 @@ class Body:
     def set_torque(self, on: bool) -> None:
         with self.world.lock:
             self.torque_on = bool(on)
+            if not on:
+                self.visual_mouth = MOUTH_CLOSED
             if on:
                 self.released = True
                 # Torque arriving must not fling the robot at a stale target.
@@ -395,14 +407,17 @@ class Handler(socketserver.StreamRequestHandler):
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         body: Body = self.server.body
         print(f"== duck {body.index}: daemon connected from {self.client_address}", flush=True)
-        for raw in self.rfile:
-            try:
-                answer = self.dispatch(body, json.loads(raw))
-            except Exception as error:  # a bad frame must not take the simulator down with it
-                answer = {"error": str(error)}
-            self.wfile.write((json.dumps(answer) + "\n").encode())
-            self.wfile.flush()
-        print(f"== duck {body.index}: daemon disconnected", flush=True)
+        try:
+            for raw in self.rfile:
+                try:
+                    answer = self.dispatch(body, json.loads(raw))
+                except Exception as error:  # a bad frame must not take the simulator down with it
+                    answer = {"error": str(error)}
+                self.wfile.write((json.dumps(answer) + "\n").encode())
+                self.wfile.flush()
+        finally:
+            body.close_visual_mouth()
+            print(f"== duck {body.index}: daemon disconnected", flush=True)
 
     def dispatch(self, body: Body, request: dict) -> dict:
         op = request.get("op")
@@ -436,13 +451,18 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def run(world: World, headless: bool) -> None:
+def run(world: World, headless: bool, visual: VisualWorld | None = None) -> None:
     """Step in real time.
 
     **Real time, not as fast as possible.** The daemon's loop is wall-clock and its health gate
     fails below 45 of 50 Hz, so a simulator running at its own pace does not merely look wrong — it
     makes every duck report unhealthy and the updater start rolling releases back.
     """
+    if visual is None and any(b.camera is not None for b in world.bodies):
+        raise ValueError("cameras require the visual world used to create their renderers")
+    if visual is None and not headless:
+        visual = VisualWorld(world)
+        visual.update()
     viewer = None
     if not headless:
         try:
@@ -451,7 +471,7 @@ def run(world: World, headless: bool) -> None:
             # No side panels: this window is for watching ducks, and everything the panels would
             # drive belongs to the daemons.
             viewer = mujoco.viewer.launch_passive(
-                world.model, world.data, show_left_ui=False, show_right_ui=False
+                visual.model, visual.data, show_left_ui=False, show_right_ui=False
             )
         except Exception as error:
             print(f"== no viewer ({error}); running headless", flush=True)
@@ -490,12 +510,20 @@ def run(world: World, headless: bool) -> None:
                 )
                 next_step = time.perf_counter()
             step += 1
-            if viewer is not None and step % passes_per_frame == 0:
+            viewer_frame = viewer is not None and step % passes_per_frame == 0
+            camera_frame = bool(eyes) and step % passes_per_eye == 0
+            if visual is not None and (viewer_frame or camera_frame):
+                if viewer is not None:
+                    with viewer.lock():
+                        visual.update()
+                else:
+                    visual.update()
+            if viewer_frame:
                 viewer.sync()
-            if eyes and step % passes_per_eye == 0:
+            if camera_frame:
                 for body in eyes:
                     if body.camera is not None:
-                        body.camera.render(world)
+                        body.camera.render(visual, viewer)
     except KeyboardInterrupt:
         pass
     finally:
@@ -564,8 +592,13 @@ def main() -> None:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
 
+    visual = VisualWorld(world) if not args.headless or wanted else None
+    if visual is not None:
+        visual.update()
+    for body in world.bodies:
+        index = body.index
         if index in wanted:
-            body.camera = Camera(world.model, f"{body.prefix}head_camera")
+            body.camera = Camera(visual.model, f"{body.prefix}head_camera")
             frames = FrameServer((args.host, args.frame_port + index), FrameHandler)
             frames.camera = body.camera
             frames.fps = args.camera_fps
@@ -577,7 +610,7 @@ def main() -> None:
         eye = f" · camera on {args.host}:{args.frame_port + index}" if index in wanted else ""
         print(f"==   duck {index}: robotd --sim {args.host}:{args.port + index}{eye}", flush=True)
 
-    run(world, headless=args.headless)
+    run(world, headless=args.headless, visual=visual)
 
 
 if __name__ == "__main__":

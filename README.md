@@ -55,6 +55,14 @@ uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096 \
 No GPU? Add `--hf-jobs` to any train command to run it on Hugging Face Jobs
 instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 
+## Live body simulator
+
+`uv run duck-body` serves the simulated body to `robotd --sim 127.0.0.1:7801`
+and opens a MuJoCo viewer. `--headless` disables the window; `--cameras a`
+enables duck A's camera stream (port 7901 by default). See
+[the simulator notes](docs/live_simulator.md) for the visual-only beak,
+its limits and the distinction from a real mouth servo.
+
 ## Tasks
 
 `uv run list-envs` prints the live registry. Flat/Rough variants exist where noted.
