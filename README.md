@@ -21,6 +21,25 @@ reward-design lessons that made it work
 
 ## Quickstart
 
+For the daemon-driven simulator (`duck-body` / runtime `scripts/duck-sim`), body
+protocol **2** synchronises `walk` and `roller` with the runtime's selected gait.
+Skating fits the existing MJCF skates and their passive wheels; returning to walking
+restores feet without restarting the body or frame servers. Joint state, planar
+position, momentum and floor clearance are preserved, and cameras/viewer follow
+the replacement model. Switching requires a robot include and a plane named
+`floor`; unsupported scenes report an error. The runtime requests simulation-only
+trunk support during the home ramp; it expires 0.3 simulated seconds after the
+new gait takes over. Ordinary walking/gliding is unsupported, with real contact
+physics. This assisted transition does not require a new balance policy.
+Update the runtime together with
+this repository; a protocol-1 daemon is incompatible. The runtime owns the
+[simulation protocol documentation](https://github.com/pollen-robotics/microduck/blob/main/docs/design/simulation.md).
+
+Physics runs on a dedicated real-time worker; slow camera or viewer frames do
+not change the policy's physics rate. Rendering stays on the main thread and
+uses the private visual snapshot. See the protocol documentation above for
+assisted recovery after a simulated fall.
+
 Requires a CUDA GPU (training runs through MuJoCo Warp) and [uv](https://docs.astral.sh/uv/).
 
 > **On ARM boxes (DGX Spark / GB10, Jetson):** `uv sync` pulls ~2 GB of CUDA

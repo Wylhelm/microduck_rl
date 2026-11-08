@@ -61,13 +61,18 @@ class Tof:
                     np.sin(elevation),
                 ]
 
-    def frame(self, data: mujoco.MjData) -> tuple[list[int], list[int]]:
+    def frame(self, data: mujoco.MjData, realism=None) -> tuple[list[int], list[int]]:
         """One capture: distances in millimetres and a status per zone.
 
         Self-hits are reported, not filtered. A real sensor sees the duck's own beak when the beak is
         in front of it, and a simulator that quietly skipped its own geometry would hide exactly the
         kind of mounting problem this is here to catch.
+
+        `realism` (a `realism.TofModel`) adds the sensor's failure modes; without it this is the
+        frame it always was.
         """
+        if realism is not None and realism.profile.active:
+            return self._realistic_frame(data, realism)
         origin = data.site_xpos[self.site].copy()
         rotation = data.site_xmat[self.site].reshape(3, 3)
         world = rotation @ self.directions.T  # (3, ZONES)
@@ -92,6 +97,65 @@ class Tof:
             # Noise that grows with range, as the datasheet has it: a few millimetres up close, a
             # couple of centimetres at the far end. Without it a simulated map is suspiciously
             # crisp, and every filter downstream goes untested.
+            sigma = 0.003 + 0.02 * (hit / MAX_RANGE)
+            measured = max(0.0, hit + self.random.normal(0.0, sigma))
+            distance_mm[zone] = int(measured * 1000.0)
+            status[zone] = STATUS_VALID
+        return distance_mm, status
+
+    def _realistic_frame(self, data: mujoco.MjData, realism) -> tuple[list[int], list[int]]:
+        """The same rays, failing the way a VL53L5CX does.
+
+        - a zone can fail outright (status 4, "consistency failed"), corners twice as often;
+        - range shrinks: nothing past `tof_max_range`, nothing dark past `tof_dark_range`;
+        - a translucent surface (glass) either returns a ghost — a range between the pane and
+          what is behind it, as two returns merged in one histogram — or is seen through.
+        """
+        from mjlab_microduck.sim.realism import (
+            DARK_LUMINANCE,
+            GLASS_ALPHA,
+            STATUS_CONSISTENCY_FAILED,
+        )
+
+        prof = realism.profile
+        origin = data.site_xpos[self.site].copy()
+        rotation = data.site_xmat[self.site].reshape(3, 3)
+        world = rotation @ self.directions.T
+        distance_mm = [0] * ZONES
+        status = [STATUS_NO_TARGET] * ZONES
+        if not np.isfinite(world).all() or np.linalg.norm(world) < 1e-9:
+            return distance_mm, status
+
+        geom = np.zeros(1, dtype=np.int32)
+        for zone in range(ZONES):
+            direction = np.ascontiguousarray(world[:, zone])
+            if realism.dropout(zone, ROWS, COLS):
+                status[zone] = STATUS_CONSISTENCY_FAILED
+                continue
+            hit = mujoco.mj_ray(self.model, data, origin, direction, None, 1, -1, geom)
+            if hit >= 0:
+                luminance, alpha = realism.surface(self.model, int(geom[0]))
+                if alpha < GLASS_ALPHA:
+                    pane = hit
+                    body = int(self.model.geom_bodyid[geom[0]])
+                    behind = -1.0
+                    if body > 0:
+                        start = origin + direction * (pane + 1e-3)
+                        behind = mujoco.mj_ray(self.model, data, start, direction, None, 1, body, geom)
+                    if realism.random.random() < prof.tof_glass_ghost:
+                        far = pane + behind if behind >= 0 else prof.tof_max_range
+                        hit = pane + realism.random.uniform(0.0, 1.0) * (far - pane)
+                        luminance = 1.0
+                    elif behind >= 0:
+                        hit = pane + 1e-3 + behind
+                        luminance, _ = realism.surface(self.model, int(geom[0]))
+                    elif body > 0:
+                        hit = -1.0
+                limit = prof.tof_dark_range if luminance < DARK_LUMINANCE else prof.tof_max_range
+                if hit > min(limit, MAX_RANGE):
+                    hit = -1.0
+            if hit < 0:
+                continue
             sigma = 0.003 + 0.02 * (hit / MAX_RANGE)
             measured = max(0.0, hit + self.random.normal(0.0, sigma))
             distance_mm[zone] = int(measured * 1000.0)
