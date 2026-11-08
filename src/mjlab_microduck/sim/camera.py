@@ -15,11 +15,11 @@ cameras at 15 fps is most of a core; four without is nothing. Most sessions do n
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 import socket
 import socketserver
 import struct
 import threading
+from contextlib import ExitStack, nullcontext
 
 import mujoco
 import numpy as np
@@ -67,7 +67,34 @@ class Camera:
     loop touches it.
     """
 
-    def __init__(self, model: mujoco.MjModel, name: str, width: int = WIDTH, height: int = HEIGHT):
+    def __init__(
+        self, model: mujoco.MjModel, name: str, width: int = WIDTH, height: int = HEIGHT,
+        *, preloaded_models: tuple[mujoco.MjModel, ...] = (),
+    ):
+        self.name = name
+        self.width = width
+        self.height = height
+        self.latest: bytes | None = None
+        self.lock = threading.Lock()
+        self._keep_renderers = bool(preloaded_models)
+        self._renderers: dict[int, tuple[mujoco.MjModel, int, mujoco.Renderer]] = {}
+        with ExitStack() as rollback:
+            rollback.callback(self.close)
+            self.bind_model(model)
+            for alternate in preloaded_models:
+                if alternate is not model:
+                    self.bind_model(alternate)
+            self.bind_model(model)
+            rollback.pop_all()
+
+    def bind_model(self, model: mujoco.MjModel) -> None:
+        if id(model) in self._renderers:
+            self.model, self.camera, self.renderer = self._renderers[id(model)]
+            return
+        if self._renderers and not self._keep_renderers:
+            self.close()
+        self.model = model
+        name = self.name
         self.camera = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, name)
         if self.camera < 0:
             raise SystemExit(f"the model has no camera {name!r}")
@@ -94,14 +121,19 @@ class Camera:
         fixed = np.zeros(4)
         mujoco.mju_mulQuat(fixed, model.cam_quat[self.camera], turn)
         model.cam_quat[self.camera] = fixed
-        self.renderer = mujoco.Renderer(model, height=height, width=width)
-        self.width = width
-        self.height = height
-        self.latest: bytes | None = None
-        self.lock = threading.Lock()
+        self.renderer = mujoco.Renderer(model, height=self.height, width=self.width)
+        self._renderers[id(model)] = (model, self.camera, self.renderer)
+
+    def close(self) -> None:
+        for _, _, renderer in self._renderers.values():
+            renderer.close()
+        self._renderers.clear()
 
     def render(self, visual, viewer=None) -> None:
-        """Render the same private snapshot as the viewer, on the step loop's thread."""
+        """Render the viewer's private snapshot, never on the physics worker."""
+        if self.model is not visual.model:
+            self.bind_model(visual.model)
+            mujoco.mj_camlight(visual.model, visual.data)
         with viewer.lock() if viewer is not None else nullcontext():
             self.renderer.update_scene(visual.data, camera=self.camera)
         packed = to_uyvy(self.renderer.render())
