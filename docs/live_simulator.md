@@ -110,8 +110,7 @@ File: `{"obstacles": [ ... ]}` or a bare list; each entry:
     rgba      optional; alpha < 0.6 makes glass for the ToF realism model
     motion    optional {"waypoints": [[x, y], ...], "speed": m/s}: ping-pong, a pacing pet
 
-Every obstacle must fit within 4 m. Place obstacles in the world frame of your own scene.
-Private room scans and scene-specific obstacle configurations are not distributed.
+Every obstacle must fit within 4 m.
 
 ## Protocol additions
 

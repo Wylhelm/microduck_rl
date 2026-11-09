@@ -23,16 +23,9 @@ from mjlab_microduck.sim.tof import Tof
 SCENE = SCENES / "scene_backlash.xml"
 
 
-def make_world(
-    profile="off", seed=0, *, no_assist=False, count=1, limp=False, **kwargs
-):
+def make_world(profile="off", seed=0, *, no_assist=False, count=1, limp=False, **kwargs):
     world = World(
-        SCENE,
-        count,
-        realism_profile=profile,
-        realism_seed=seed,
-        no_assist=no_assist,
-        **kwargs,
+        SCENE, count, realism_profile=profile, realism_seed=seed, no_assist=no_assist, **kwargs
     )
     for index in range(count):
         body = Body(world, index, limp=limp)
@@ -68,33 +61,22 @@ def test_off_profile_leaves_model_and_sensors_untouched():
     np.testing.assert_array_equal(world.model.body_mass, plain.body_mass)
     body = world.bodies[0]
     assert body.sensor_model is None and body.link is None and body.tof_realism is None
-    np.testing.assert_array_equal(
-        body._gain, plain.actuator_gainprm[body.actuator_slice, 0]
-    )
+    np.testing.assert_array_equal(body._gain, plain.actuator_gainprm[body.actuator_slice, 0])
 
     world.step(10)
     answer = Handler.dispatch(object.__new__(Handler), body, {"op": "read"})
     data = world.data
-    quat = data.qpos[body.trunk + 3 : body.trunk + 7]
+    quat = data.qpos[body.trunk + 3:body.trunk + 7]
     for slot, wire in enumerate(body.to_wire):
         assert answer["positions"][wire] == float(data.qpos[body.qpos_adr[slot]])
         assert answer["velocities"][wire] == float(data.qvel[body.qvel_adr[slot]])
     assert answer["imu"]["quat"] == [float(v) for v in quat]
     assert answer["imu"]["gravity"] == [float(v) for v in gravity_in_trunk(quat)]
-    assert answer["imu"]["gyro"] == [
-        float(v) for v in data.qvel[body.trunk_dof + 3 : body.trunk_dof + 6]
-    ]
+    assert answer["imu"]["gyro"] == [float(v) for v in data.qvel[body.trunk_dof + 3:body.trunk_dof + 6]]
     assert "commanded_mode" not in answer
     assert set(answer) == {
-        "positions",
-        "velocities",
-        "currents_ma",
-        "trunk_z",
-        "trunk",
-        "sim_time",
-        "mode",
-        "supported",
-        "imu",
+        "positions", "velocities", "currents_ma", "trunk_z", "trunk", "sim_time", "mode",
+        "supported", "imu",
     }
 
     # A write lands immediately, as it always did.
@@ -139,13 +121,9 @@ def test_model_randomization_is_seeded_and_in_range():
     np.testing.assert_array_equal(worlds[0].model.body_mass, worlds[1].model.body_mass)
     assert not np.array_equal(worlds[0].model.body_mass, worlds[2].model.body_mass)
     for world in worlds:
-        ratio = world.model.body_mass[1:] / np.where(
-            plain.body_mass[1:] > 0, plain.body_mass[1:], 1
-        )
+        ratio = world.model.body_mass[1:] / np.where(plain.body_mass[1:] > 0, plain.body_mass[1:], 1)
         moved = plain.body_mass[1:] > 0
-        assert np.all(ratio[moved] >= prof.mass[0] - 1e-9) and np.all(
-            ratio[moved] <= prof.mass[1] + 1e-9
-        )
+        assert np.all(ratio[moved] >= prof.mass[0] - 1e-9) and np.all(ratio[moved] <= prof.mass[1] + 1e-9)
         floor = mujoco.mj_name2id(plain, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         scale = world.model.geom_friction[floor, 0] / plain.geom_friction[floor, 0]
         assert prof.friction[0] <= scale <= prof.friction[1] and scale != 1.0
@@ -159,9 +137,7 @@ def test_motor_strength_survives_an_equipment_change():
     world = make_world("real", 3)
     body = world.bodies[0]
     before = {JOINT_NAMES[w]: g for w, g in zip(body.to_wire, body._gain)}
-    nominal = mujoco.MjModel.from_xml_path(str(SCENE)).actuator_gainprm[
-        body.actuator_slice, 0
-    ]
+    nominal = mujoco.MjModel.from_xml_path(str(SCENE)).actuator_gainprm[body.actuator_slice, 0]
     world.set_mode(0, "roller")
     world.set_mode(0, "walk")
     after = {JOINT_NAMES[w]: g for w, g in zip(body.to_wire, body._gain)}
@@ -208,18 +184,12 @@ def test_gyro_bias_drifts_and_heading_drifts():
     model.record(0.0, zeros, zeros, upright, np.zeros(3), np.array([0, 0, -1.0]))
     start = model.frames[-1][1]
     for step in range(1, 1001):
-        model.record(
-            step * 0.02, zeros, zeros, upright, np.zeros(3), np.array([0, 0, -1.0])
-        )
+        model.record(step * 0.02, zeros, zeros, upright, np.zeros(3), np.array([0, 0, -1.0]))
     end = model.frames[-1][1]
     assert np.any(start["gyro"] != 0)  # power-up bias
     assert not np.allclose(start["gyro"], end["gyro"])  # random walk
-    yaw = lambda q: math.atan2(
-        2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] ** 2 + q[3] ** 2)
-    )
-    assert abs(yaw(end["quat"]) - yaw(start["quat"])) == pytest.approx(
-        abs(model.yaw_rate) * 20, abs=2e-3
-    )
+    yaw = lambda q: math.atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] ** 2 + q[3] ** 2))
+    assert abs(yaw(end["quat"]) - yaw(start["quat"])) == pytest.approx(abs(model.yaw_rate) * 20, abs=2e-3)
 
 
 def test_command_latency_delays_targets_by_15_to_30_ms():
@@ -273,14 +243,8 @@ def test_sensor_latency_returns_an_older_frame():
     model = realism.SensorModel(prof, 0, 0, JOINT_NAMES)
     zeros = np.zeros(len(JOINT_NAMES))
     for step in range(10):
-        model.record(
-            step * 0.005,
-            zeros + step,
-            zeros,
-            np.array([1.0, 0, 0, 0]),
-            np.zeros(3),
-            np.array([0, 0, -1.0]),
-        )
+        model.record(step * 0.005, zeros + step, zeros, np.array([1.0, 0, 0, 0]), np.zeros(3),
+                     np.array([0, 0, -1.0]))
     frame = model.frame_at(0.045 - 0.02)
     assert np.median(frame["positions"]) == pytest.approx(5, abs=0.05)
 
@@ -300,18 +264,14 @@ def test_no_assist_mode_request_neither_swaps_nor_supports():
     body = world.bodies[0]
     body.set_torque(True)
     handler = object.__new__(Handler)
-    assert (
-        handler.dispatch(body, {"op": "mode", "mode": "roller", "support": True}) == {}
-    )
+    assert handler.dispatch(body, {"op": "mode", "mode": "roller", "support": True}) == {}
     assert world.modes[0] == "walk"
     assert body.support_pose is None
     answer = handler.dispatch(body, {"op": "read"})
     assert answer["mode"] == "walk" and answer["commanded_mode"] == "roller"
     assert answer["supported"] is False
     # The human fits the skates; nothing steadies the trunk while they do.
-    assert handler.dispatch(body, {"op": "equipment.fit", "equipment": "roller"}) == {
-        "mode": "roller"
-    }
+    assert handler.dispatch(body, {"op": "equipment.fit", "equipment": "roller"}) == {"mode": "roller"}
     assert world.modes[0] == "roller" and body.support_pose is None
     world.step(20)
     assert body.support_pose is None
@@ -352,10 +312,7 @@ def test_equipment_fit_works_with_assist_too():
     world = make_world()
     body = world.bodies[0]
     handler = object.__new__(Handler)
-    assert (
-        handler.dispatch(body, {"op": "equipment.fit", "equipment": "roller"})["mode"]
-        == "roller"
-    )
+    assert handler.dispatch(body, {"op": "equipment.fit", "equipment": "roller"})["mode"] == "roller"
     assert body.support_pose is None
 
 
@@ -365,24 +322,15 @@ def test_equipment_fit_works_with_assist_too():
 def test_oracle_pose_is_the_truth_and_says_so():
     world = make_world("hard", 4)
     body = world.bodies[0]
-    world.data.qpos[body.trunk : body.trunk + 2] = [1.5, -0.5]
+    world.data.qpos[body.trunk:body.trunk + 2] = [1.5, -0.5]
     yaw = 0.7
-    world.data.qpos[body.trunk + 3 : body.trunk + 7] = [
-        math.cos(yaw / 2),
-        0,
-        0,
-        math.sin(yaw / 2),
-    ]
+    world.data.qpos[body.trunk + 3:body.trunk + 7] = [math.cos(yaw / 2), 0, 0, math.sin(yaw / 2)]
     pose = Handler.dispatch(object.__new__(Handler), body, {"op": "oracle.pose"})
     assert pose["oracle"] is True
     assert (pose["x"], pose["y"]) == (1.5, -0.5)
     assert pose["yaw"] == pytest.approx(yaw)
     info = Handler.dispatch(object.__new__(Handler), body, {"op": "sim.info"})
-    assert (
-        info["realism"] == "hard"
-        and info["realism_seed"] == 4
-        and info["no_assist"] is False
-    )
+    assert info["realism"] == "hard" and info["realism_seed"] == 4 and info["no_assist"] is False
 
 
 def test_unknown_profile_is_refused():
