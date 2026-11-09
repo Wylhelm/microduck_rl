@@ -5,7 +5,7 @@
                                         "pose": {"x": 1.0, "y": 0.0, "yaw_deg": 30}}}
 
 **Slots, compiled in once.** Adding a body to a compiled MuJoCo model means recompiling it, which
-takes seconds for the apartment and would drop every daemon's control tick on the floor. So the
+takes seconds for a large scene and would drop every daemon's control tick on the floor. So the
 world is compiled with a fixed number of mocap bodies (`obstacle_0` …), each with `PARTS` box geoms
 parked under the floor, collision off and invisible. An obstacle is a slot whose geoms are given a
 shape, a colour and the floor's collision bits, and whose mocap body is moved to its pose. Mocap
@@ -72,18 +72,11 @@ def slot_geom(slot: int, part: int) -> str:
 
 def add_slots(spec: mujoco.MjSpec, count: int) -> None:
     for slot in range(count):
-        body = spec.worldbody.add_body(
-            name=slot_body(slot), mocap=True, pos=[0.0, 0.0, PARK_Z]
-        )
+        body = spec.worldbody.add_body(name=slot_body(slot), mocap=True, pos=[0.0, 0.0, PARK_Z])
         for part in range(PARTS):
             body.add_geom(
-                name=slot_geom(slot, part),
-                type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[SLOT_HALF] * 3,
-                contype=0,
-                conaffinity=0,
-                group=0,
-                rgba=[0.5, 0.5, 0.5, 0.0],
+                name=slot_geom(slot, part), type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[SLOT_HALF] * 3, contype=0, conaffinity=0, group=0, rgba=[0.5, 0.5, 0.5, 0.0],
             )
 
 
@@ -117,21 +110,12 @@ class Obstacle:
 
     def describe(self) -> dict:
         out = dict(self.spec)
-        out["pose"] = {
-            "x": self.x,
-            "y": self.y,
-            "z": self.z,
-            "yaw_deg": math.degrees(self.yaw),
-        }
+        out["pose"] = {"x": self.x, "y": self.y, "z": self.z, "yaw_deg": math.degrees(self.yaw)}
         return out
 
 
-def _box(
-    sx: float, sy: float, sz: float, x: float = 0.0, y: float = 0.0, z0: float = 0.0
-) -> Part:
-    return Part(
-        mujoco.mjtGeom.mjGEOM_BOX, (sx / 2, sy / 2, sz / 2), (x, y, z0 + sz / 2)
-    )
+def _box(sx: float, sy: float, sz: float, x: float = 0.0, y: float = 0.0, z0: float = 0.0) -> Part:
+    return Part(mujoco.mjtGeom.mjGEOM_BOX, (sx / 2, sy / 2, sz / 2), (x, y, z0 + sz / 2))
 
 
 def _floats(value, count: int, what: str) -> list[float]:
@@ -157,29 +141,17 @@ def parse(entry: dict) -> Obstacle:
         parts = [_box(sx, sy, sz)]
     elif shape == "cylinder":
         diameter, height = _floats(entry.get("size"), 2, "size")
-        parts = [
-            Part(
-                mujoco.mjtGeom.mjGEOM_CYLINDER,
-                (diameter / 2, height / 2, 0.0),
-                (0.0, 0.0, height / 2),
-            )
-        ]
+        parts = [Part(mujoco.mjtGeom.mjGEOM_CYLINDER, (diameter / 2, height / 2, 0.0),
+                      (0.0, 0.0, height / 2))]
     elif shape == "door":
-        width, thickness, height = _floats(
-            entry.get("size", [0.8, 0.04, 2.0]), 3, "size"
-        )
+        width, thickness, height = _floats(entry.get("size", [0.8, 0.04, 2.0]), 3, "size")
         parts = [_box(thickness, width, height)]
     elif shape == "chair":
-        width, depth, seat, back = _floats(
-            entry.get("size", [0.42, 0.42, 0.45, 0.4]), 4, "size"
-        )
+        width, depth, seat, back = _floats(entry.get("size", [0.42, 0.42, 0.45, 0.4]), 4, "size")
         leg, plate = 0.03, 0.03
         dx, dy = depth / 2 - leg / 2, width / 2 - leg / 2
-        parts = [
-            _box(leg, leg, seat - plate, sx * dx, sy * dy)
-            for sx in (-1, 1)
-            for sy in (-1, 1)
-        ]
+        parts = [_box(leg, leg, seat - plate, sx * dx, sy * dy)
+                 for sx in (-1, 1) for sy in (-1, 1)]
         parts.append(_box(depth, width, plate, z0=seat - plate))
         parts.append(_box(plate, width, back, -depth / 2 + plate / 2, z0=seat))
     else:
@@ -190,15 +162,11 @@ def parse(entry: dict) -> Obstacle:
         for item in raw:
             size = _floats(item.get("size"), 3, "part size")
             pos = _floats(item.get("pos", [0, 0, 0]), 3, "part pos")
-            parts.append(
-                Part(mujoco.mjtGeom.mjGEOM_BOX, tuple(s / 2 for s in size), tuple(pos))
-            )
+            parts.append(Part(mujoco.mjtGeom.mjGEOM_BOX, tuple(s / 2 for s in size), tuple(pos)))
     if len(parts) > PARTS:
         raise ValueError(f"an obstacle has at most {PARTS} parts")
     for part in parts:
-        if min(part.size[:2]) <= 0 or (
-            part.kind == mujoco.mjtGeom.mjGEOM_BOX and part.size[2] <= 0
-        ):
+        if min(part.size[:2]) <= 0 or (part.kind == mujoco.mjtGeom.mjGEOM_BOX and part.size[2] <= 0):
             raise ValueError("obstacle sizes must be positive")
 
     # Centre the parts on the mocap frame, so they stay inside the compiled bounding volume.
@@ -210,20 +178,13 @@ def parse(entry: dict) -> Obstacle:
     rgba = entry.get("rgba", DEFAULT_RGBA[shape])
     rgba = _floats(rgba, 4, "rgba")
     if rgba[3] <= 0:
-        raise ValueError(
-            "an obstacle must not be fully transparent: nothing would see it"
-        )
+        raise ValueError("an obstacle must not be fully transparent: nothing would see it")
     pose = entry.get("pose", {})
     if not isinstance(pose, dict):
         raise ValueError("pose must be an object")
     obstacle = Obstacle(
-        name=name,
-        shape=shape,
-        parts=parts,
-        rgba=rgba,
-        x=float(pose.get("x", 0.0)),
-        y=float(pose.get("y", 0.0)),
-        z=float(pose.get("z", 0.0)),
+        name=name, shape=shape, parts=parts, rgba=rgba,
+        x=float(pose.get("x", 0.0)), y=float(pose.get("y", 0.0)), z=float(pose.get("z", 0.0)),
         yaw=math.radians(float(pose.get("yaw_deg", 0.0))),
         spec={k: v for k, v in entry.items() if k != "pose"},
     )
@@ -248,9 +209,7 @@ def load(path: Path) -> list[dict]:
     raw = json.loads(Path(path).read_text())
     entries = raw.get("obstacles") if isinstance(raw, dict) else raw
     if not isinstance(entries, list):
-        raise ValueError(
-            f'{path}: expected a list of obstacles or {{"obstacles": [...]}}'
-        )
+        raise ValueError(f"{path}: expected a list of obstacles or {{\"obstacles\": [...]}}")
     return entries
 
 
@@ -299,11 +258,7 @@ class Obstacles:
             x = float(pose.get("x", obstacle.x))
             y = float(pose.get("y", obstacle.y))
             z = float(pose.get("z", obstacle.z))
-            yaw = (
-                math.radians(float(pose["yaw_deg"]))
-                if "yaw_deg" in pose
-                else obstacle.yaw
-            )
+            yaw = math.radians(float(pose["yaw_deg"])) if "yaw_deg" in pose else obstacle.yaw
             if not all(math.isfinite(v) for v in (x, y, z, yaw)):
                 raise ValueError("pose must be finite")
             obstacle.x, obstacle.y, obstacle.z, obstacle.yaw = x, y, z, yaw
@@ -353,10 +308,8 @@ class Obstacles:
         out = []
         for slot in range(min(self.capacity, slot_count(model))):
             body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, slot_body(slot))
-            geoms = [
-                mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, slot_geom(slot, p))
-                for p in range(PARTS)
-            ]
+            geoms = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, slot_geom(slot, p))
+                     for p in range(PARTS)]
             out.append((body, int(model.body_mocapid[body]), geoms))
         floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         # What the duck collides with, it collides with: the floor's bits, whatever the scene's.
@@ -365,22 +318,15 @@ class Obstacles:
         self._id_cache[model] = (out, contype or 1, conaffinity or 1)
         return self._id_cache[model]
 
-    def sync(
-        self,
-        model: mujoco.MjModel,
-        data: mujoco.MjData | None = None,
-        *,
-        geometry: bool = True,
-    ) -> None:
+    def sync(self, model: mujoco.MjModel, data: mujoco.MjData | None = None,
+             *, geometry: bool = True) -> None:
         """Write the obstacles into `model` (shapes, colour, collision) and `data` (poses)."""
         if not self.capacity:
             return
         with self.lock:
             self._sync(model, data, geometry)
 
-    def _sync(
-        self, model: mujoco.MjModel, data: mujoco.MjData | None, geometry: bool
-    ) -> None:
+    def _sync(self, model: mujoco.MjModel, data: mujoco.MjData | None, geometry: bool) -> None:
         slots, contype, conaffinity = self._ids(model)
         for slot, (body, mocap, geoms) in enumerate(slots):
             obstacle = self.slots[slot]
@@ -389,11 +335,7 @@ class Obstacles:
                 model.body_contype[body] = contype if active else 0
                 model.body_conaffinity[body] = conaffinity if active else 0
                 for part, geom in enumerate(geoms):
-                    piece = (
-                        obstacle.parts[part]
-                        if active and part < len(obstacle.parts)
-                        else None
-                    )
+                    piece = obstacle.parts[part] if active and part < len(obstacle.parts) else None
                     if piece is None:
                         model.geom_contype[geom] = 0
                         model.geom_conaffinity[geom] = 0
@@ -426,12 +368,8 @@ class Obstacles:
                         obstacle.y + s * centre[0] + c * centre[1],
                         obstacle.z + centre[2],
                     ]
-                    data.mocap_quat[mocap] = [
-                        math.cos(obstacle.yaw / 2),
-                        0.0,
-                        0.0,
-                        math.sin(obstacle.yaw / 2),
-                    ]
+                    data.mocap_quat[mocap] = [math.cos(obstacle.yaw / 2), 0.0, 0.0,
+                                              math.sin(obstacle.yaw / 2)]
 
     def _centre(self, obstacle: Obstacle) -> np.ndarray:
         low = np.min([np.subtract(p.pos, _half(p)) for p in obstacle.parts], axis=0)

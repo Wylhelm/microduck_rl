@@ -45,9 +45,7 @@ class Profile:
     gyro_bias: float = 0.0  # rad/s, std of the per-axis bias at power-up
     gyro_bias_walk: float = 0.0  # rad/s/sqrt(s), random walk of that bias
     gravity_noise: float = 0.0  # std per component of the projected gravity
-    imu_tilt_deg: float = (
-        0.0  # mounting error: random axis, magnitude uniform in [0, this]
-    )
+    imu_tilt_deg: float = 0.0  # mounting error: random axis, magnitude uniform in [0, this]
     yaw_drift: float = 0.0  # rad/s, std of the game-rotation-vector heading drift rate
     quat_half: bool = False  # quaternion components shipped as IEEE binary16
     # Joint encoders: XL330 present position / velocity.
@@ -62,23 +60,14 @@ class Profile:
     read_drop: float = 0.0  # probability a read returns the previous (stale) frame
     write_drop: float = 0.0  # probability a target write is lost
     # The body and the floor, drawn once per model.
-    friction: tuple[float, float] = (
-        1.0,
-        1.0,
-    )  # sliding-friction scale, floor and duck geoms
+    friction: tuple[float, float] = (1.0, 1.0)  # sliding-friction scale, floor and duck geoms
     mass: tuple[float, float] = (1.0, 1.0)  # per-body mass and inertia scale
     kp: tuple[float, float] = (1.0, 1.0)  # per-motor position-gain (strength) scale
     # VL53L5CX, on top of `tof.py`'s range noise.
-    tof_dropout: float = (
-        0.0  # per-zone probability of a failed status (corners twice that)
-    )
+    tof_dropout: float = 0.0  # per-zone probability of a failed status (corners twice that)
     tof_max_range: float = 4.0  # m, beyond which a zone reports no target
-    tof_dark_range: float = (
-        4.0  # m, the same for dark surfaces (luminance < DARK_LUMINANCE)
-    )
-    tof_glass_ghost: float = (
-        0.0  # probability a translucent surface returns a mixed range
-    )
+    tof_dark_range: float = 4.0  # m, the same for dark surfaces (luminance < DARK_LUMINANCE)
+    tof_glass_ghost: float = 0.0  # probability a translucent surface returns a mixed range
 
     @property
     def active(self) -> bool:
@@ -170,18 +159,14 @@ def profile(name: str) -> Profile:
     try:
         return PROFILES[name]
     except KeyError:
-        raise ValueError(
-            f"realism must be one of {', '.join(PROFILES)}, not {name!r}"
-        ) from None
+        raise ValueError(f"realism must be one of {', '.join(PROFILES)}, not {name!r}") from None
 
 
 def stream(seed: int, duck: int, kind: int, *extra: int) -> np.random.Generator:
     return np.random.default_rng(np.random.SeedSequence([seed, duck, kind, *extra]))
 
 
-def keyed_uniform(
-    seed: int, duck: int, name: str, bounds: tuple[float, float]
-) -> float:
+def keyed_uniform(seed: int, duck: int, name: str, bounds: tuple[float, float]) -> float:
     """One draw per named part, independent of how many parts the model has or their order.
 
     `duck` -1 is the world itself (the floor).
@@ -214,9 +199,7 @@ def randomize_model(
     if floor >= 0:
         model.geom_friction[floor, 0] *= friction
     for duck, prefix in enumerate(prefixes):
-        trunk = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_BODY, prefix + "trunk_base"
-        )
+        trunk = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, prefix + "trunk_base")
         if trunk < 0:
             continue
         for geom in range(model.ngeom):
@@ -226,9 +209,7 @@ def randomize_model(
             if model.body_rootid[body] != trunk:
                 continue
             name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body) or str(body)
-            scale = keyed_uniform(
-                seed, duck, "mass:" + name.removeprefix(prefix), prof.mass
-            )
+            scale = keyed_uniform(seed, duck, "mass:" + name.removeprefix(prefix), prof.mass)
             model.body_mass[body] *= scale
             model.body_inertia[body] *= scale
 
@@ -248,24 +229,14 @@ class SensorModel:
         self.profile = prof
         self.imu = stream(seed, duck, _IMU)
         self.encoder = stream(seed, duck, _ENCODER)
-        self.joint_bias = np.array(
-            [
-                keyed_uniform(
-                    seed, duck, "encoder:" + name, (-prof.joint_bias, prof.joint_bias)
-                )
-                for name in joints
-            ]
-        )
-        self.gyro_bias = (
-            self.imu.normal(0.0, prof.gyro_bias, 3) if prof.gyro_bias else np.zeros(3)
-        )
+        self.joint_bias = np.array([
+            keyed_uniform(seed, duck, "encoder:" + name, (-prof.joint_bias, prof.joint_bias))
+            for name in joints
+        ])
+        self.gyro_bias = self.imu.normal(0.0, prof.gyro_bias, 3) if prof.gyro_bias else np.zeros(3)
         axis = self.imu.normal(size=3)
         axis /= max(np.linalg.norm(axis), 1e-12)
-        angle = (
-            math.radians(self.imu.uniform(0.0, prof.imu_tilt_deg))
-            if prof.imu_tilt_deg
-            else 0.0
-        )
+        angle = math.radians(self.imu.uniform(0.0, prof.imu_tilt_deg)) if prof.imu_tilt_deg else 0.0
         tilt = np.zeros(4)
         mujoco.mju_axisAngle2Quat(tilt, axis, angle)
         self.mount = np.zeros(9)
@@ -281,21 +252,14 @@ class SensorModel:
         return np.round(values / step) * step if step else values
 
     def record(
-        self,
-        time: float,
-        positions: np.ndarray,
-        velocities: np.ndarray,
-        quat: np.ndarray,
-        gyro: np.ndarray,
-        gravity: np.ndarray,
+        self, time: float, positions: np.ndarray, velocities: np.ndarray,
+        quat: np.ndarray, gyro: np.ndarray, gravity: np.ndarray,
     ) -> None:
         prof = self.profile
         dt = 0.0 if self.last_time is None else max(0.0, time - self.last_time)
         self.last_time = time
         if prof.gyro_bias_walk and dt:
-            self.gyro_bias = self.gyro_bias + self.imu.normal(
-                0.0, prof.gyro_bias_walk * math.sqrt(dt), 3
-            )
+            self.gyro_bias = self.gyro_bias + self.imu.normal(0.0, prof.gyro_bias_walk * math.sqrt(dt), 3)
         self.yaw_error += self.yaw_rate * dt
 
         gyro = self.mount @ gyro + self.gyro_bias
@@ -311,36 +275,25 @@ class SensorModel:
         mujoco.mju_mulQuat(mounted, measured, self.mount_quat)
         if prof.quat_half:
             # SFLP ships x/y/z as binary16 and the reader reconstructs w (`imu.rs`).
-            xyz = mounted[1:].astype(np.float16).astype(np.float64) * (
-                1 if mounted[0] >= 0 else -1
-            )
+            xyz = mounted[1:].astype(np.float16).astype(np.float64) * (1 if mounted[0] >= 0 else -1)
             w = math.sqrt(max(0.0, 1.0 - float(xyz @ xyz)))
             mounted = np.array([w, *xyz])
 
         positions = positions + self.joint_bias
         if prof.joint_noise:
-            positions = positions + self.encoder.normal(
-                0.0, prof.joint_noise, positions.shape
-            )
+            positions = positions + self.encoder.normal(0.0, prof.joint_noise, positions.shape)
         positions = self._quantize(positions, prof.joint_quant)
         if prof.velocity_noise:
-            velocities = velocities + self.encoder.normal(
-                0.0, prof.velocity_noise, velocities.shape
-            )
+            velocities = velocities + self.encoder.normal(0.0, prof.velocity_noise, velocities.shape)
         velocities = self._quantize(velocities, prof.velocity_quant)
 
-        self.frames.append(
-            (
-                time,
-                {
-                    "positions": positions,
-                    "velocities": velocities,
-                    "gyro": gyro,
-                    "gravity": gravity,
-                    "quat": mounted,
-                },
-            )
-        )
+        self.frames.append((time, {
+            "positions": positions,
+            "velocities": velocities,
+            "gyro": gyro,
+            "gravity": gravity,
+            "quat": mounted,
+        }))
 
     def frame_at(self, time: float) -> dict | None:
         """The newest frame recorded no later than `time` — what a late read actually returns."""
@@ -372,16 +325,10 @@ class Link:
         return float(self.random.uniform(low, high)) if high > 0 else 0.0
 
     def drop_read(self) -> bool:
-        return (
-            bool(self.profile.read_drop)
-            and self.random.random() < self.profile.read_drop
-        )
+        return bool(self.profile.read_drop) and self.random.random() < self.profile.read_drop
 
     def drop_write(self) -> bool:
-        return (
-            bool(self.profile.write_drop)
-            and self.random.random() < self.profile.write_drop
-        )
+        return bool(self.profile.write_drop) and self.random.random() < self.profile.write_drop
 
 
 class CommandQueue:
