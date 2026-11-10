@@ -47,13 +47,21 @@
       <!-- 125 kp -->
       <!-- <position kp="0.35" kv="0.0" forcerange="-0.96 0.96" ctrlrange="-10.0 10.0"/> -->
     </default>
+    <!-- Skate-wheel bearings. Zero frictionloss makes the wheels free in the rolling direction,
+         so the duck coasts forever: a 0.04 m/s nudge still reads 0.04 m/s 15 s later, which is not
+         a skate, it is an air-hockey puck. Rolling resistance of a urethane wheel on a hard floor
+         is Crr 0.01-0.02, and tau = Crr * N * r with N = 0.74 kg * g / 4 = 1.81 N per wheel and
+         r = 14.6 mm gives 0.0003-0.0005 N m. 0.0004 N m coasts 0.26 m/s for 1.8 s over 23 cm (a
+         glide) and kills a 0.04 m/s creep in 0.27 s over 5 mm (no drift). It sits inside the
+         roller policy's training envelope, whose wheel frictionloss curriculum ends at 0.0015
+         (`microduck_velocity_rollers_env_cfg.py`), so the gait was trained against this drag. -->
     <default class="passive_wheel">
       <geom contype="0" conaffinity="0"/>
-      <joint damping="0.0" frictionloss="0.0" armature="0.0001"/>
+      <joint damping="0.0" frictionloss="0.0004" armature="0.0001"/>
     </default>
     <default class="passive_joint">
       <geom contype="0" conaffinity="0"/>
-      <joint damping="0.0" frictionloss="0.0" armature="0.0001"/>
+      <joint damping="0.0" frictionloss="0.0004" armature="0.0001"/>
     </default>
   </default>
   <!-- Additional sensors.xml -->
